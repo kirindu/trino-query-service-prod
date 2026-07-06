@@ -1,5 +1,6 @@
 import os
 import re
+import socket
 import decimal
 import datetime
 from typing import Any
@@ -76,6 +77,54 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, decimal.Decimal):
         return float(value)
     return value
+
+
+def get_default_gateway_linux() -> str | None:
+    """
+    Returns the Docker container default gateway IP.
+    In many Linux Docker environments, this gateway points to the Docker host.
+
+    This is used as a fallback when TRINO_HOST=host.docker.internal
+    but that hostname is not automatically available inside the container.
+    """
+    try:
+        with open("/proc/net/route") as route_file:
+            for line in route_file.readlines()[1:]:
+                fields = line.strip().split()
+
+                # Destination 00000000 means default route
+                if len(fields) >= 3 and fields[1] == "00000000":
+                    gateway_hex = fields[2]
+
+                    return ".".join(
+                        str(int(gateway_hex[i:i + 2], 16))
+                        for i in (6, 4, 2, 0)
+                    )
+
+    except Exception:
+        return None
+
+    return None
+
+
+def resolve_trino_host() -> str:
+    """
+    Resolves the real Trino host.
+
+    If TRINO_HOST is host.docker.internal and Docker/Linux does not resolve it,
+    fallback to the container default gateway IP.
+    """
+    if TRINO_HOST == "host.docker.internal":
+        try:
+            socket.gethostbyname(TRINO_HOST)
+            return TRINO_HOST
+        except socket.gaierror:
+            gateway = get_default_gateway_linux()
+
+            if gateway:
+                return gateway
+
+    return TRINO_HOST
 
 
 def clean_sql(sql: str) -> str:
@@ -161,7 +210,7 @@ def get_connection():
         auth = BasicAuthentication(TRINO_USER, TRINO_PASSWORD)
 
     return connect(
-        host=TRINO_HOST,
+        host=resolve_trino_host(),
         port=TRINO_PORT,
         user=TRINO_USER,
         catalog=TRINO_CATALOG,
@@ -175,7 +224,10 @@ def get_connection():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "trino-query-service"}
+    return {
+        "ok": True,
+        "service": "trino-query-service",
+    }
 
 
 @app.post("/query")
@@ -218,4 +270,4 @@ def query_trino(
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"failed to execute: {str(e)}")
